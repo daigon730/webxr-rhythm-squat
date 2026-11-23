@@ -514,7 +514,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     var btn = this; btn.disabled = true; btn.textContent = '立位を記録中…（まっすぐ立ってください）';
     setTimeout(function(){
       state.calibrated = true; state.depth = 0;
-      $('calibStatus').textContent = '記録済み：立位 = 0cm'; $('calibStatus').classList.add('ok');
+      $('calibStatus').textContent = '記録済み：いまの姿勢が下降量 0cm の基準です'; $('calibStatus').classList.add('ok');
       btn.textContent = '記録し直す'; btn.disabled = false;
       var sb = $('startBtn'); sb.disabled = false; sb.textContent = 'スタート（約84秒）';
       drawFigure(0);
@@ -706,7 +706,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
   // ---------- WebXR: full 3D scene in VR (Three.js) ----------
   // Gates stream from the far end toward the player and cross z=0 exactly on their beat
   // (same g.time the 2D loop judges on), so judgement and 3D motion never drift apart.
-  var xrSession = null, xrStandingY = null;
+  var xrSession = null, xrStandingY = null, xrCalibSamples = [];
   var xrBtn = $('xrBtn'), xrStatus = $('xrStatus');
   var VR = null; // three.js state while a session is live
   var VR_SPEED = 2.4; // m/s gate approach speed (visual only; timing derives from g.time)
@@ -724,17 +724,26 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
   xrSupported();
 
   function markCalibratedUI(){
-    $('calibStatus').textContent = '記録済み：立位 = 0cm'; $('calibStatus').classList.add('ok');
+    $('calibStatus').textContent = (typeof xrStandingY === 'number')
+      ? '記録済み：立位 ' + xrStandingY.toFixed(2) + 'm（下降量 0cm の基準）'
+      : '記録済み：立位 = 0cm';
+    $('calibStatus').classList.add('ok');
+    if(xrSession && typeof xrStandingY === 'number') xrStatus.textContent = '立位を記録しました：' + xrStandingY.toFixed(2) + 'm';
     var sb = $('startBtn'); sb.disabled = false; sb.textContent = 'スタート（約84秒）';
   }
   // When calibration is pressed while in VR, capture the real standing head height on next frames.
-  $('calibBtn').addEventListener('click', function(){ xrStandingY = null; state.xrCalibPending = true; });
+  // Only arm the capture while an XR session is actually live: a click on the 2D page must not
+  // leave a stale pending flag that fires on the first (still poseless) frame of a later session.
+  $('calibBtn').addEventListener('click', function(){
+    if(window.__xrLive && xrSession){ xrStandingY = null; xrCalibSamples = []; state.xrCalibPending = true; }
+    else state.xrCalibPending = false;
+  });
 
   xrBtn.addEventListener('click', function(){
     if(xrSession){ xrSession.end(); return; }
     if(!navigator.xr) return;
     navigator.xr.requestSession('immersive-vr', { optionalFeatures:['local-floor','bounded-floor','local'] }).then(function(session){
-      xrSession = session; xrStandingY = null; window.__xrLive = true;
+      xrSession = session; xrStandingY = null; xrCalibSamples = []; state.xrCalibPending = false; window.__xrLive = true;
       xrStatus.textContent = 'VR入室中：ゲートが立体表示されます'; xrBtn.textContent = 'VRを出る';
       session.addEventListener('end', onXREnd);
       session.addEventListener('select', onXRSelect);
@@ -748,7 +757,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
 
   function onXREnd(){
     if(VR){ try{ VR.renderer.setAnimationLoop(null); VR.renderer.dispose(); }catch(e){} VR = null; }
-    xrSession = null; xrStandingY = null; window.__xrLive = false; state.xrActive = false;
+    xrSession = null; xrStandingY = null; xrCalibSamples = []; state.xrCalibPending = false; window.__xrLive = false; state.xrActive = false;
     xrStatus.textContent = 'VRを終了しました'; xrBtn.textContent = 'VRで入る（Quest）';
   }
 
@@ -757,12 +766,12 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     ensureAudio();
     if(state.playing) return;
     if(state.screen === 'screenResult'){ startGame(); return; }
-    if(xrStandingY === null){ state.xrCalibPending = true; return; } // next frames capture standing height
+    if(xrStandingY === null){ xrCalibSamples = []; state.xrCalibPending = true; return; } // next frames capture standing height
     startGame();
   }
 
   // ----- fallback: head-height judgement only, if the Three.js CDN could not load -----
-  var fb = null;
+  var fb = null, fbRefType = 'local-floor';
   function fallbackXR(session){
     xrStatus.textContent = 'VR入室中（3D表示ライブラリ未読込のため判定のみ動作）';
     var canvas = document.createElement('canvas');
@@ -771,7 +780,8 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     if(gl.makeXRCompatible) gl.makeXRCompatible();
     session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
     fb = { gl: gl, refSpace: null };
-    session.requestReferenceSpace('local-floor').catch(function(){ return session.requestReferenceSpace('local'); })
+    fbRefType = 'local-floor';
+    session.requestReferenceSpace('local-floor').catch(function(){ fbRefType = 'local'; return session.requestReferenceSpace('local'); })
       .then(function(rs){ fb.refSpace = rs; }).catch(function(){});
     session.requestAnimationFrame(function fbFrame(time, frame){
       if(!xrSession) return;
@@ -785,14 +795,31 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
   }
 
   // Shared: turn a live head height (metres) into the depth the game loop judges on.
+  // Calibration is never a single frame: right after entering VR the viewer pose is often
+  // not acquired yet and the camera still reports the origin (y = 0), which used to be
+  // recorded as a "0m" standing height and pinned the depth at 0cm forever. Capture now
+  // averages stable, plausible samples and ignores origin / out-of-range values.
   function feedHeadY(y){
+    if(typeof y !== 'number' || !isFinite(y)) return;
     if(state.xrCalibPending){
-      xrStandingY = y; state.calibrated = true; state.xrCalibPending = false;
+      var refType = VR ? VR.refType : fbRefType;
+      // local-floor: a standing head is roughly 0.8-2.3m above the floor. y near 0 there
+      // means "no pose yet", not a measurement — keep waiting instead of recording 0m.
+      if(refType === 'local-floor' && (y < 0.8 || y > 2.3)) return;
+      if(xrCalibSamples.length && Math.abs(y - xrCalibSamples[xrCalibSamples.length - 1]) > 0.06){
+        xrCalibSamples = [y]; // head moved mid-capture: restart the sample window
+      } else xrCalibSamples.push(y);
+      if(xrCalibSamples.length < 15) return; // ~0.25s of stable samples
+      var sum = 0; xrCalibSamples.forEach(function(v){ sum += v; });
+      xrStandingY = sum / xrCalibSamples.length;
+      xrCalibSamples = [];
+      state.calibrated = true; state.xrCalibPending = false;
+      state.xrDepth = 0;
       markCalibratedUI();
-      if(VR) VR.standY = y;
+      if(VR) VR.standY = xrStandingY;
       return;
     }
-    if(xrStandingY === null){ if(state.calibrated) xrStandingY = y; else return; }
+    if(xrStandingY === null) return; // never auto-calibrate from a stray first frame
     if(VR) VR.standY = xrStandingY;
     var d = (xrStandingY - y) * 100; // cm descent
     state.xrDepth = Math.max(0, Math.min(MAX_DEPTH, d));
@@ -822,7 +849,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       renderer: renderer,
       scene: new THREE.Scene(),
       camera: new THREE.PerspectiveCamera(70, 1, 0.05, 120),
-      standY: 1.6, floorY: 0, floorKnown: false,
+      standY: 1.6, floorY: 0, floorKnown: false, refType: 'local-floor',
       gates: {}, hudAt: 0, boardAt: 0, boardMode: '', tmpV: new THREE.Vector3()
     };
     VR.scene.background = new THREE.Color(0x10130f);
@@ -830,6 +857,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     renderer.xr.setSession(session).then(function(){
       renderer.setAnimationLoop(xrTick);
     }).catch(function(){
+      VR.refType = 'local';
       renderer.xr.setReferenceSpaceType('local');
       renderer.xr.setSession(session).then(function(){ renderer.setAnimationLoop(xrTick); })
         .catch(function(){ xrStatus.textContent = 'VRの描画を開始できませんでした'; });
@@ -941,7 +969,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       ctx.fillText('② 記録できたら、もう一度トリガーでスタート', 70, 322);
     } else {
       ctx.fillStyle = '#2FBFA5';
-      ctx.fillText('立位は記録済みです', 70, 258);
+      ctx.fillText('立位は記録済みです（' + xrStandingY.toFixed(2) + 'm）', 70, 258);
       ctx.fillStyle = '#FFFFFF';
       ctx.fillText('トリガーを押すとスタートします', 70, 322);
     }
@@ -1020,11 +1048,29 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     VR.judgeTex.tex.needsUpdate = true;
   }
 
-  function xrTick(){
+  function xrTick(time, frame){
     if(!VR || !xrSession) return;
-    var cam = VR.renderer.xr.getCamera();
-    cam.getWorldPosition(VR.tmpV);
-    var camY = VR.tmpV.y;
+    var camY = null;
+    if(frame){
+      var refSpace = null;
+      try{ refSpace = VR.renderer.xr.getReferenceSpace(); }catch(e){}
+      if(refSpace){
+        var pose = null;
+        try{ pose = frame.getViewerPose(refSpace); }catch(e){}
+        if(!pose){
+          // Tracking not acquired yet: the camera still sits at the origin (0,0,0).
+          // Feeding that as a head height is exactly what recorded "0m" calibrations.
+          VR.renderer.render(VR.scene, VR.camera);
+          return;
+        }
+        camY = pose.transform.position.y;
+      }
+    }
+    if(camY === null || typeof camY !== 'number' || !isFinite(camY)){
+      var cam = VR.renderer.xr.getCamera();
+      cam.getWorldPosition(VR.tmpV);
+      camY = VR.tmpV.y;
+    }
     if(!VR.floorKnown){
       // local-floor: floor is y=0. 'local' fallback: estimate floor 1.62m below the first head height.
       VR.floorKnown = true;
